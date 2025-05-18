@@ -24,7 +24,8 @@ class AgentBase:
     args: the arguments for agent training. `args = Config()`
     """
 
-    def __init__(self, net_dims: [int], state_dim: int, action_dim: int, gpu_id: int = 0, args: Config = Config()):
+    def __init__(self, net_dims: [int], state_dim: int, action_dim: int, gpu_id: int = 0, args: Config = Config(),
+                 use_amp: bool=True):
         self.if_discrete: bool = args.if_discrete
         self.if_off_policy: bool = args.if_off_policy
 
@@ -66,6 +67,8 @@ class AgentBase:
 
         """save and load"""
         self.save_attr_names = {'act', 'act_target', 'act_optimizer', 'cri', 'cri_target', 'cri_optimizer'}
+        self.use_amp=use_amp
+        self.scaler=th.amp.GradScaler("cuda") if use_amp else None
 
     def explore_env(self, env, horizon_len: int) -> tuple[TEN, TEN, TEN, TEN, TEN]:
         if self.if_vec_env:
@@ -74,7 +77,11 @@ class AgentBase:
             return self._explore_one_env(env=env, horizon_len=horizon_len)
 
     def explore_action(self, state: TEN) -> TEN:
-        return self.act.get_action(state, action_std=self.explore_noise_std)
+        if self.use_amp:
+            with th.cuda.amp.autocast():
+                return self.act.get_action(state, action_std=self.explore_noise_std)
+        else:
+            return self.act.get_action(state, action_std=self.explore_noise_std)
 
     def _explore_one_env(self, env, horizon_len: int) -> tuple[TEN, TEN, TEN, TEN, TEN]:
         """
@@ -190,50 +197,100 @@ class AgentBase:
 
     def update_objectives(self, buffer: ReplayBuffer, update_t: int) -> tuple[float, float]:
         assert isinstance(update_t, int)
+        
+        # 提取样本（不需要混合精度）
         with th.no_grad():
             if self.if_use_per:
                 (state, action, reward, undone, unmask, next_state,
-                 is_weight, is_index) = buffer.sample_for_per(self.batch_size)
+                is_weight, is_index) = buffer.sample_for_per(self.batch_size)
             else:
                 state, action, reward, undone, unmask, next_state = buffer.sample(self.batch_size)
                 is_weight, is_index = None, None
-
-            next_action = self.act(next_state)  # deterministic policy
-            next_q = self.cri_target(next_state, next_action)
+            
+            # 使用混合精度进行前向推断
+            if self.use_amp:
+                with th.cuda.amp.autocast():
+                    next_action = self.act(next_state)  # deterministic policy
+                    next_q = self.cri_target(next_state, next_action)
+            else:
+                next_action = self.act(next_state)  # deterministic policy
+                next_q = self.cri_target(next_state, next_action)
 
             q_label = reward + undone * self.gamma * next_q
 
-        q_value = self.cri(state, action) * unmask
-        td_error = self.criterion(q_value, q_label) * unmask
-        if self.if_use_per:
-            obj_critic = (td_error * is_weight).mean()
-            buffer.td_error_update_for_per(is_index.detach(), td_error.detach())
+        # Critic 更新
+        if self.use_amp:
+            with th.cuda.amp.autocast():
+                q_value = self.cri(state, action) * unmask
+                td_error = self.criterion(q_value, q_label) * unmask
+                if self.if_use_per:
+                    obj_critic = (td_error * is_weight).mean()
+                else:
+                    obj_critic = td_error.mean()
+            
+            # 使用scaler进行反向传播
+            self.cri_optimizer.zero_grad()
+            self.scaler.scale(obj_critic).backward()
+            self.scaler.unscale_(self.cri_optimizer)
+            th.nn.utils.clip_grad_norm_(self.cri.parameters(), self.clip_grad_norm)
+            self.scaler.step(self.cri_optimizer)
+            self.scaler.update()
         else:
-            obj_critic = td_error.mean()
-        self.optimizer_backward(self.cri_optimizer, obj_critic)
+            q_value = self.cri(state, action) * unmask
+            td_error = self.criterion(q_value, q_label) * unmask
+            if self.if_use_per:
+                obj_critic = (td_error * is_weight).mean()
+                buffer.td_error_update_for_per(is_index.detach(), td_error.detach())
+            else:
+                obj_critic = td_error.mean()
+            self.optimizer_backward(self.cri_optimizer, obj_critic)
+        
         self.soft_update(self.cri_target, self.cri, self.soft_update_tau)
 
+        # Actor 更新
         if_update_act = bool(buffer.cur_size >= self.buffer_init_size)
         if if_update_act:
-            action_pg = self.act(state)  # action to policy gradient
-            obj_actor = self.cri(state, action_pg).mean()
-            self.optimizer_backward(self.act_optimizer, -obj_actor)
+            if self.use_amp:
+                with th.cuda.amp.autocast():
+                    action_pg = self.act(state)  # action to policy gradient
+                    obj_actor = self.cri(state, action_pg).mean()
+                
+                # 使用scaler进行反向传播
+                self.act_optimizer.zero_grad()
+                self.scaler.scale(-obj_actor).backward()
+                self.scaler.unscale_(self.act_optimizer)
+                th.nn.utils.clip_grad_norm_(self.act.parameters(), self.clip_grad_norm)
+                self.scaler.step(self.act_optimizer)
+                self.scaler.update()
+            else:
+                action_pg = self.act(state)  # action to policy gradient
+                obj_actor = self.cri(state, action_pg).mean()
+                self.optimizer_backward(self.act_optimizer, -obj_actor)
+            
             self.soft_update(self.act_target, self.act, self.soft_update_tau)
         else:
             obj_actor = th.tensor(th.nan)
+    
         return obj_critic.item(), obj_actor.item()
 
     def get_cumulative_rewards(self, rewards: TEN, undones: TEN) -> TEN:
         cum_rewards = th.empty_like(rewards)
-
         masks = undones * self.gamma
         horizon_len = rewards.shape[0]
 
         last_state = self.last_state
-        next_action = self.act_target(last_state)
-        next_value = self.cri_target(last_state, next_action).detach()
+        
+        if self.use_amp:
+            with th.cuda.amp.autocast():
+                next_action = self.act_target(last_state)
+                next_value = self.cri_target(last_state, next_action).detach()
+        else:
+            next_action = self.act_target(last_state)
+            next_value = self.cri_target(last_state, next_action).detach()
+        
         for t in range(horizon_len - 1, -1, -1):
             cum_rewards[t] = next_value = rewards[t] + masks[t] * next_value
+        
         return cum_rewards
 
     def optimizer_backward(self, optimizer: th.optim, objective: TEN):
@@ -242,6 +299,8 @@ class AgentBase:
         optimizer: `optimizer = th.optim.SGD(net.parameters(), learning_rate)`
         objective: `objective = net(...)` the optimization objective, sometimes is a loss function.
         """
+        if self.use_amp:
+            return self.optimizer_backward_amp(optimizer,objective)
         optimizer.zero_grad()
         objective.backward()
         clip_grad_norm_(parameters=optimizer.param_groups[0]["params"], max_norm=self.clip_grad_norm)
@@ -255,16 +314,15 @@ class AgentBase:
         optimizer: `optimizer = th.optim.SGD(net.parameters(), learning_rate)`
         objective: `objective = net(...)` the optimization objective, sometimes is a loss function.
         """
-        amp_scale = th.cuda.amp.GradScaler()  # write in __init__()
-
+        
         optimizer.zero_grad()
-        amp_scale.scale(objective).backward()  # loss.backward()
-        amp_scale.unscale_(optimizer)  # amp
+        self.scaler.scale(objective).backward()  # loss.backward()
+        self.scaler.unscale_(optimizer)  # amp
 
         # from th.nn.utils import clip_grad_norm_
         clip_grad_norm_(parameters=optimizer.param_groups[0]["params"], max_norm=self.clip_grad_norm)
-        amp_scale.step(optimizer)  # optimizer.step()
-        amp_scale.update()  # optimizer.step()
+        self.scaler.step(optimizer)  # optimizer.step()
+        self.scaler.update()  # optimizer.step()
 
     @staticmethod
     def soft_update(target_net: th.nn.Module, current_net: th.nn.Module, tau: float):
