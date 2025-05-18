@@ -81,7 +81,7 @@ class Config:
         self.eval_env_class = None  # eval_env = eval_env_class(*eval_env_args)
         self.eval_env_args = None  # eval_env = eval_env_class(*eval_env_args)
         self.eval_record_step = 0  # evaluator start recording after the exploration reaches this step.
-
+        self.use_tensorboard = False
     def init_before_training(self):
         if self.random_seed is None:
             self.random_seed = max(0, self.gpu_id)
