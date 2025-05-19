@@ -78,7 +78,7 @@ class AgentBase:
 
     def explore_action(self, state: TEN) -> TEN:
         if self.use_amp:
-            with th.cuda.amp.autocast():
+            with th.amp.autocast('cuda'):
                 return self.act.get_action(state, action_std=self.explore_noise_std)
         else:
             return self.act.get_action(state, action_std=self.explore_noise_std)
@@ -209,7 +209,7 @@ class AgentBase:
             
             # 使用混合精度进行前向推断
             if self.use_amp:
-                with th.cuda.amp.autocast():
+                with th.amp.autocast('cuda'):
                     next_action = self.act(next_state)  # deterministic policy
                     next_q = self.cri_target(next_state, next_action)
             else:
@@ -220,7 +220,7 @@ class AgentBase:
 
         # Critic 更新
         if self.use_amp:
-            with th.cuda.amp.autocast():
+            with th.amp.autocast('cuda'):
                 q_value = self.cri(state, action) * unmask
                 td_error = self.criterion(q_value, q_label) * unmask
                 if self.if_use_per:
@@ -251,7 +251,7 @@ class AgentBase:
         if_update_act = bool(buffer.cur_size >= self.buffer_init_size)
         if if_update_act:
             if self.use_amp:
-                with th.cuda.amp.autocast():
+                with th.amp.autocast('cuda'):
                     action_pg = self.act(state)  # action to policy gradient
                     obj_actor = self.cri(state, action_pg).mean()
                 
@@ -281,7 +281,7 @@ class AgentBase:
         last_state = self.last_state
         
         if self.use_amp:
-            with th.cuda.amp.autocast():
+            with th.amp.autocast('cuda'):
                 next_action = self.act_target(last_state)
                 next_value = self.cri_target(last_state, next_action).detach()
         else:

@@ -31,13 +31,25 @@ class AgentSAC(AgentBase):
         self.target_entropy = np.log(action_dim)
 
     def explore_action(self, state: TEN) -> TEN:
-        return self.act.get_action(state)
+        if self.use_amp:
+            with th.amp.autocast('cuda'):
+                return self.act.get_action(state)
+        else:
+            return self.act.get_action(state)
 
     def _explore_one_action(self, state: TEN) -> TEN:
-        return self.act.get_action(state.unsqueeze(0))[0]
+        if self.use_amp:
+            with th.amp.autocast('cuda'):
+                return self.act.get_action(state.unsqueeze(0))[0]
+        else:
+            return self.act.get_action(state.unsqueeze(0))[0]
 
     def _explore_vec_action(self, state: TEN) -> TEN:
-        return self.act.get_action(state)
+        if self.use_amp:
+            with th.amp.autocast('cuda'):
+                return self.act.get_action(state)
+        else:
+            return self.act.get_action(state)
 
     def update_objectives(self, buffer: ReplayBuffer, update_t: int) -> Tuple[float, float]:
         assert isinstance(update_t, int)
@@ -49,39 +61,92 @@ class AgentSAC(AgentBase):
                 state, action, reward, undone, unmask, next_state = buffer.sample(self.batch_size)
                 is_weight, is_index = None, None
 
-            next_action, next_logprob = self.act.get_action_logprob(next_state)  # stochastic policy
-            next_q = th.min(self.cri_target.get_q_values(next_state, next_action), dim=1)[0]
-            alpha = self.alpha_log.exp()
-            q_label = reward + undone * self.gamma * (next_q - next_logprob * alpha)
+            # 使用混合精度进行前向推断
+            if self.use_amp:
+                with th.amp.autocast('cuda'):
+                    next_action, next_logprob = self.act.get_action_logprob(next_state)  # stochastic policy
+                    next_q = th.min(self.cri_target.get_q_values(next_state, next_action), dim=1)[0]
+                    alpha = self.alpha_log.exp()
+                    q_label = reward + undone * self.gamma * (next_q - next_logprob * alpha)
+            else:
+                next_action, next_logprob = self.act.get_action_logprob(next_state)  # stochastic policy
+                next_q = th.min(self.cri_target.get_q_values(next_state, next_action), dim=1)[0]
+                alpha = self.alpha_log.exp()
+                q_label = reward + undone * self.gamma * (next_q - next_logprob * alpha)
 
-        '''objective of critic (loss function of critic)'''
-        q_values = self.cri.get_q_values(state, action)
-        q_labels = q_label.view((-1, 1)).repeat(1, q_values.shape[1])
-        td_error = self.criterion(q_values, q_labels).mean(dim=1) * unmask
-        if self.if_use_per:
-            obj_critic = (td_error * is_weight).mean()
-            buffer.td_error_update_for_per(is_index.detach(), td_error.detach())
+        # 使用混合精度处理critic网络的前向传播和反向传播
+        if self.use_amp:
+            with th.amp.autocast('cuda'):
+                q_values = self.cri.get_q_values(state, action)
+                q_labels = q_label.view((-1, 1)).repeat(1, q_values.shape[1])
+                td_error = self.criterion(q_values, q_labels).mean(dim=1) * unmask
+                if self.if_use_per:
+                    obj_critic = (td_error * is_weight).mean()
+                else:
+                    obj_critic = td_error.mean()
+                if self.lambda_fit_cum_r:
+                    cum_reward_mean = buffer.cum_rewards[buffer.ids0, buffer.ids1].detach_().mean().repeat(q_values.shape[1])
+                    obj_critic += self.criterion(cum_reward_mean, q_values.mean(dim=0)).mean() * self.lambda_fit_cum_r
+            
+            self.cri_optimizer.zero_grad()
+            self.scaler.scale(obj_critic).backward()
+            self.scaler.unscale_(self.cri_optimizer)
+            th.nn.utils.clip_grad_norm_(self.cri.parameters(), self.clip_grad_norm)
+            self.scaler.step(self.cri_optimizer)
+            self.scaler.update()
         else:
-            obj_critic = td_error.mean()
-        if self.lambda_fit_cum_r:
-            cum_reward_mean = buffer.cum_rewards[buffer.ids0, buffer.ids1].detach_().mean().repeat(q_values.shape[1])
-            obj_critic += self.criterion(cum_reward_mean, q_values.mean(dim=0)).mean() * self.lambda_fit_cum_r
-        self.optimizer_backward(self.cri_optimizer, obj_critic)
+            q_values = self.cri.get_q_values(state, action)
+            q_labels = q_label.view((-1, 1)).repeat(1, q_values.shape[1])
+            td_error = self.criterion(q_values, q_labels).mean(dim=1) * unmask
+            if self.if_use_per:
+                obj_critic = (td_error * is_weight).mean()
+                buffer.td_error_update_for_per(is_index.detach(), td_error.detach())
+            else:
+                obj_critic = td_error.mean()
+            if self.lambda_fit_cum_r:
+                cum_reward_mean = buffer.cum_rewards[buffer.ids0, buffer.ids1].detach_().mean().repeat(q_values.shape[1])
+                obj_critic += self.criterion(cum_reward_mean, q_values.mean(dim=0)).mean() * self.lambda_fit_cum_r
+            self.optimizer_backward(self.cri_optimizer, obj_critic)
+        
         self.soft_update(self.cri_target, self.cri, self.soft_update_tau)
 
-        '''objective of alpha (temperature parameter automatic adjustment)'''
-        action_pg, logprob = self.act.get_action_logprob(state)  # policy gradient
-        obj_alpha = (self.alpha_log * (self.target_entropy - logprob).detach()).mean()
-        self.optimizer_backward(self.alpha_optim, obj_alpha)
+        # 使用混合精度处理alpha的优化
+        if self.use_amp:
+            with th.amp.autocast('cuda'):
+                action_pg, logprob = self.act.get_action_logprob(state)  # policy gradient
+                obj_alpha = (self.alpha_log * (self.target_entropy - logprob).detach()).mean()
+            
+            self.alpha_optim.zero_grad()
+            self.scaler.scale(obj_alpha).backward()
+            self.scaler.unscale_(self.alpha_optim)
+            self.scaler.step(self.alpha_optim)
+            self.scaler.update()
+        else:
+            action_pg, logprob = self.act.get_action_logprob(state)  # policy gradient
+            obj_alpha = (self.alpha_log * (self.target_entropy - logprob).detach()).mean()
+            self.optimizer_backward(self.alpha_optim, obj_alpha)
 
-        '''objective of actor'''
+        # 使用混合精度处理actor网络的前向传播和反向传播
         alpha = self.alpha_log.exp().detach()
         with th.no_grad():
             self.alpha_log[:] = self.alpha_log.clamp(-16, 2)
 
-        q_value_pg = self.cri_target(state, action_pg).mean()
-        obj_actor = (q_value_pg - logprob * alpha).mean()
-        self.optimizer_backward(self.act_optimizer, -obj_actor)
+        if self.use_amp:
+            with th.amp.autocast('cuda'):
+                q_value_pg = self.cri_target(state, action_pg).mean()
+                obj_actor = (q_value_pg - logprob * alpha).mean()
+            
+            self.act_optimizer.zero_grad()
+            self.scaler.scale(-obj_actor).backward()
+            self.scaler.unscale_(self.act_optimizer)
+            th.nn.utils.clip_grad_norm_(self.act.parameters(), self.clip_grad_norm)
+            self.scaler.step(self.act_optimizer)
+            self.scaler.update()
+        else:
+            q_value_pg = self.cri_target(state, action_pg).mean()
+            obj_actor = (q_value_pg - logprob * alpha).mean()
+            self.optimizer_backward(self.act_optimizer, -obj_actor)
+        
         # self.soft_update(self.act_target, self.act, self.soft_update_tau)
         return obj_critic.item(), obj_actor.item()
 
@@ -116,32 +181,72 @@ class AgentModSAC(AgentSAC):  # Modified SAC using reliable_lambda and Two Time-
                 state, action, reward, undone, unmask, next_state = buffer.sample(self.batch_size)
                 is_weight, is_index = None, None
 
-            next_action, next_logprob = self.act.get_action_logprob(next_state)  # stochastic policy
-            next_q = th.min(self.cri_target.get_q_values(next_state, next_action), dim=1)[0]
-            alpha = self.alpha_log.exp()
-            q_label = reward + undone * self.gamma * (next_q - next_logprob * alpha)
+            # 使用混合精度进行前向推断
+            if self.use_amp:
+                with th.amp.autocast('cuda'):
+                    next_action, next_logprob = self.act.get_action_logprob(next_state)  # stochastic policy
+                    next_q = th.min(self.cri_target.get_q_values(next_state, next_action), dim=1)[0]
+                    alpha = self.alpha_log.exp()
+                    q_label = reward + undone * self.gamma * (next_q - next_logprob * alpha)
+            else:
+                next_action, next_logprob = self.act.get_action_logprob(next_state)  # stochastic policy
+                next_q = th.min(self.cri_target.get_q_values(next_state, next_action), dim=1)[0]
+                alpha = self.alpha_log.exp()
+                q_label = reward + undone * self.gamma * (next_q - next_logprob * alpha)
 
-        '''objective of critic (loss function of critic)'''
-        q_values = self.cri.get_q_values(state, action)
-        q_labels = q_label.view((-1, 1)).repeat(1, q_values.shape[1])
-        td_error = self.criterion(q_values, q_labels).mean(dim=1) * unmask
-        if self.if_use_per:
-            obj_critic = (td_error * is_weight).mean()
-            buffer.td_error_update_for_per(is_index.detach(), td_error.detach())
+        # 使用混合精度处理critic网络的前向传播和反向传播
+        if self.use_amp:
+            with th.amp.autocast('cuda'):
+                q_values = self.cri.get_q_values(state, action)
+                q_labels = q_label.view((-1, 1)).repeat(1, q_values.shape[1])
+                td_error = self.criterion(q_values, q_labels).mean(dim=1) * unmask
+                if self.if_use_per:
+                    obj_critic = (td_error * is_weight).mean()
+                else:
+                    obj_critic = td_error.mean()
+                if self.lambda_fit_cum_r != 0:
+                    cum_reward_mean = buffer.cum_rewards[buffer.ids0, buffer.ids1].detach_().mean().repeat(q_values.shape[1])
+                    obj_critic += self.criterion(cum_reward_mean, q_values.mean(dim=0)).mean() * self.lambda_fit_cum_r
+            
+            self.cri_optimizer.zero_grad()
+            self.scaler.scale(obj_critic).backward()
+            self.scaler.unscale_(self.cri_optimizer)
+            th.nn.utils.clip_grad_norm_(self.cri.parameters(), self.clip_grad_norm)
+            self.scaler.step(self.cri_optimizer)
+            self.scaler.update()
         else:
-            obj_critic = td_error.mean()
-        if self.lambda_fit_cum_r != 0:
-            cum_reward_mean = buffer.cum_rewards[buffer.ids0, buffer.ids1].detach_().mean().repeat(q_values.shape[1])
-            obj_critic += self.criterion(cum_reward_mean, q_values.mean(dim=0)).mean() * self.lambda_fit_cum_r
-        self.optimizer_backward(self.cri_optimizer, obj_critic)
+            q_values = self.cri.get_q_values(state, action)
+            q_labels = q_label.view((-1, 1)).repeat(1, q_values.shape[1])
+            td_error = self.criterion(q_values, q_labels).mean(dim=1) * unmask
+            if self.if_use_per:
+                obj_critic = (td_error * is_weight).mean()
+                buffer.td_error_update_for_per(is_index.detach(), td_error.detach())
+            else:
+                obj_critic = td_error.mean()
+            if self.lambda_fit_cum_r != 0:
+                cum_reward_mean = buffer.cum_rewards[buffer.ids0, buffer.ids1].detach_().mean().repeat(q_values.shape[1])
+                obj_critic += self.criterion(cum_reward_mean, q_values.mean(dim=0)).mean() * self.lambda_fit_cum_r
+            self.optimizer_backward(self.cri_optimizer, obj_critic)
+        
         self.soft_update(self.cri_target, self.cri, self.soft_update_tau)
 
-        '''objective of alpha (temperature parameter automatic adjustment)'''
-        action_pg, logprob = self.act.get_action_logprob(state)  # policy gradient
-        obj_alpha = (self.alpha_log * (self.target_entropy - logprob).detach()).mean()
-        self.optimizer_backward(self.alpha_optim, obj_alpha)
+        # 使用混合精度处理alpha的优化
+        if self.use_amp:
+            with th.amp.autocast('cuda'):
+                action_pg, logprob = self.act.get_action_logprob(state)  # policy gradient
+                obj_alpha = (self.alpha_log * (self.target_entropy - logprob).detach()).mean()
+            
+            self.alpha_optim.zero_grad()
+            self.scaler.scale(obj_alpha).backward()
+            self.scaler.unscale_(self.alpha_optim)
+            self.scaler.step(self.alpha_optim)
+            self.scaler.update()
+        else:
+            action_pg, logprob = self.act.get_action_logprob(state)  # policy gradient
+            obj_alpha = (self.alpha_log * (self.target_entropy - logprob).detach()).mean()
+            self.optimizer_backward(self.alpha_optim, obj_alpha)
 
-        '''objective of actor'''
+        # 使用混合精度处理actor网络的前向传播和反向传播
         alpha = self.alpha_log.exp().detach()
         with th.no_grad():
             self.alpha_log[:] = self.alpha_log.clamp(-16, 2)
@@ -152,9 +257,22 @@ class AgentModSAC(AgentSAC):  # Modified SAC using reliable_lambda and Two Time-
         if (self.update_a / (update_t + 1)) < (1 / (2 - reliable_lambda)):  # auto Two-time update rule
             self.update_a += 1
 
-            q_value_pg = self.cri_target(state, action_pg).mean()
-            obj_actor = (q_value_pg - logprob * alpha).mean()
-            self.optimizer_backward(self.act_optimizer, -obj_actor)
+            if self.use_amp:
+                with th.amp.autocast('cuda'):
+                    q_value_pg = self.cri_target(state, action_pg).mean()
+                    obj_actor = (q_value_pg - logprob * alpha).mean()
+                
+                self.act_optimizer.zero_grad()
+                self.scaler.scale(-obj_actor).backward()
+                self.scaler.unscale_(self.act_optimizer)
+                th.nn.utils.clip_grad_norm_(self.act.parameters(), self.clip_grad_norm)
+                self.scaler.step(self.act_optimizer)
+                self.scaler.update()
+            else:
+                q_value_pg = self.cri_target(state, action_pg).mean()
+                obj_actor = (q_value_pg - logprob * alpha).mean()
+                self.optimizer_backward(self.act_optimizer, -obj_actor)
+            
             self.soft_update(self.act_target, self.act, self.soft_update_tau)
         else:
             obj_actor = th.tensor(th.nan)

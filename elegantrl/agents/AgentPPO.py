@@ -11,8 +11,8 @@ TEN = th.Tensor
 
 class AgentPPO(AgentBase):
     """PPO algorithm + GAE
-    “Proximal Policy Optimization Algorithms”. John Schulman. et al.. 2017.
-    “Generalized Advantage Estimation”. John Schulman. et al..
+    "Proximal Policy Optimization Algorithms". John Schulman. et al.. 2017.
+    "Generalized Advantage Estimation". John Schulman. et al..
     """
 
     def __init__(self, net_dims: [int], state_dim: int, action_dim: int, gpu_id: int = 0, args: Config = Config()):
@@ -129,7 +129,11 @@ class AgentPPO(AgentBase):
         return states, actions, logprobs, rewards, undones, unmasks
 
     def explore_action(self, state: TEN) -> tuple[TEN, TEN]:
-        actions, logprobs = self.act.get_action(state)
+        if self.use_amp:
+            with th.amp.autocast('cuda'):
+                actions, logprobs = self.act.get_action(state)
+        else:
+            actions, logprobs = self.act.get_action(state)
         return actions, logprobs
 
     def update_net(self, buffer) -> tuple[float, float, float]:
@@ -139,11 +143,22 @@ class AgentPPO(AgentBase):
         with th.no_grad():
             states, actions, logprobs, rewards, undones, unmasks = buffer
             bs = max(1, 2 ** 10 // self.num_envs)  # set a smaller 'batch_size' to avoid CUDA OOM
-            values = [self.cri(states[i:i + bs]) for i in range(0, buffer_size, bs)]
-            values = th.cat(values, dim=0).squeeze(-1)  # values.shape == (buffer_size, )
-
-            advantages = self.get_advantages(states, rewards, undones, unmasks, values)  # shape == (buffer_size, )
-            reward_sums = advantages + values  # reward_sums.shape == (buffer_size, )
+            
+            # 使用混合精度进行批量推断
+            if self.use_amp:
+                with th.amp.autocast('cuda'):
+                    values = [self.cri(states[i:i + bs]) for i in range(0, buffer_size, bs)]
+                    values = th.cat(values, dim=0).squeeze(-1)  # values.shape == (buffer_size, )
+                    
+                    advantages = self.get_advantages(states, rewards, undones, unmasks, values)  # shape == (buffer_size, )
+                    reward_sums = advantages + values  # reward_sums.shape == (buffer_size, )
+            else:
+                values = [self.cri(states[i:i + bs]) for i in range(0, buffer_size, bs)]
+                values = th.cat(values, dim=0).squeeze(-1)  # values.shape == (buffer_size, )
+                
+                advantages = self.get_advantages(states, rewards, undones, unmasks, values)  # shape == (buffer_size, )
+                reward_sums = advantages + values  # reward_sums.shape == (buffer_size, )
+                
             del rewards, undones, values
 
             advantages = (advantages - advantages.mean()) / (advantages[::4, ::4].std() + 1e-5)  # avoid CUDA OOM
@@ -186,22 +201,48 @@ class AgentPPO(AgentBase):
         advantage = advantages[ids0, ids1]
         reward_sum = reward_sums[ids0, ids1]
 
-        value = self.cri(state).squeeze(1)  # critic network predicts the reward_sum (Q value) of state
-        obj_critic = (self.criterion(value, reward_sum) * unmask).mean()
-        self.optimizer_backward(self.cri_optimizer, obj_critic)
+        # 使用混合精度处理critic网络的前向传播和反向传播
+        if self.use_amp:
+            with th.amp.autocast('cuda'):
+                value = self.cri(state).squeeze(1)  # critic network predicts the reward_sum (Q value) of state
+                obj_critic = (self.criterion(value, reward_sum) * unmask).mean()
+            
+            self.cri_optimizer.zero_grad()
+            self.scaler.scale(obj_critic).backward()
+            self.scaler.unscale_(self.cri_optimizer)
+            th.nn.utils.clip_grad_norm_(self.cri.parameters(), self.clip_grad_norm)
+            self.scaler.step(self.cri_optimizer)
+            self.scaler.update()
+        else:
+            value = self.cri(state).squeeze(1)  # critic network predicts the reward_sum (Q value) of state
+            obj_critic = (self.criterion(value, reward_sum) * unmask).mean()
+            self.optimizer_backward(self.cri_optimizer, obj_critic)
 
-        new_logprob, entropy = self.act.get_logprob_entropy(state, action)
-        ratio = (new_logprob - logprob.detach()).exp()
-
-        # surrogate1 = advantage * ratio
-        # surrogate2 = advantage * ratio.clamp(1 - self.ratio_clip, 1 + self.ratio_clip)
-        # surrogate = th.min(surrogate1, surrogate2)  # save as below
-        surrogate = advantage * ratio * th.where(advantage.gt(0), 1 - self.ratio_clip, 1 + self.ratio_clip)
-
-        obj_surrogate = (surrogate * unmask).mean()  # major actor objective
-        obj_entropy = (entropy * unmask).mean()  # minor actor objective
-        obj_actor_full = obj_surrogate - obj_entropy * self.lambda_entropy
-        self.optimizer_backward(self.act_optimizer, -obj_actor_full)
+        # 使用混合精度处理actor网络的前向传播和反向传播
+        if self.use_amp:
+            with th.amp.autocast('cuda'):
+                new_logprob, entropy = self.act.get_logprob_entropy(state, action)
+                ratio = (new_logprob - logprob.detach()).exp()
+                surrogate = advantage * ratio * th.where(advantage.gt(0), 1 - self.ratio_clip, 1 + self.ratio_clip)
+                obj_surrogate = (surrogate * unmask).mean()  # major actor objective
+                obj_entropy = (entropy * unmask).mean()  # minor actor objective
+                obj_actor_full = obj_surrogate - obj_entropy * self.lambda_entropy
+            
+            self.act_optimizer.zero_grad()
+            self.scaler.scale(-obj_actor_full).backward()
+            self.scaler.unscale_(self.act_optimizer)
+            th.nn.utils.clip_grad_norm_(self.act.parameters(), self.clip_grad_norm)
+            self.scaler.step(self.act_optimizer)
+            self.scaler.update()
+        else:
+            new_logprob, entropy = self.act.get_logprob_entropy(state, action)
+            ratio = (new_logprob - logprob.detach()).exp()
+            surrogate = advantage * ratio * th.where(advantage.gt(0), 1 - self.ratio_clip, 1 + self.ratio_clip)
+            obj_surrogate = (surrogate * unmask).mean()  # major actor objective
+            obj_entropy = (entropy * unmask).mean()  # minor actor objective
+            obj_actor_full = obj_surrogate - obj_entropy * self.lambda_entropy
+            self.optimizer_backward(self.act_optimizer, -obj_actor_full)
+        
         return obj_critic.item(), obj_surrogate.item(), obj_entropy.item()
 
     def get_advantages(self, states: TEN, rewards: TEN, undones: TEN, unmasks: TEN, values: TEN) -> TEN:
@@ -210,14 +251,23 @@ class AgentPPO(AgentBase):
         # update undones rewards when truncated
         truncated = th.logical_not(unmasks)
         if th.any(truncated):
-            rewards[truncated] += self.cri(states[truncated]).squeeze(1).detach()
-            undones[truncated] = False
+            if self.use_amp:
+                with th.amp.autocast('cuda'):
+                    rewards[truncated] += self.cri(states[truncated]).squeeze(1).detach()
+                    undones[truncated] = False
+            else:
+                rewards[truncated] += self.cri(states[truncated]).squeeze(1).detach()
+                undones[truncated] = False
 
         masks = undones * self.gamma
         horizon_len = rewards.shape[0]
 
         next_state = self.last_state.clone()
-        next_value = self.cri(next_state).detach().squeeze(-1)
+        if self.use_amp:
+            with th.amp.autocast('cuda'):
+                next_value = self.cri(next_state).detach().squeeze(-1)
+        else:
+            next_value = self.cri(next_state).detach().squeeze(-1)
 
         advantage = th.zeros_like(next_value)  # last advantage value by GAE (Generalized Advantage Estimate)
         if self.if_use_v_trace:  # get advantage value in reverse time series (V-trace)
@@ -251,7 +301,7 @@ class AgentPPO(AgentBase):
 
 class AgentA2C(AgentPPO):
     """A2C algorithm.
-    “Asynchronous Methods for Deep Reinforcement Learning”. 2016.
+    "Asynchronous Methods for Deep Reinforcement Learning". 2016.
     """
 
     def update_net(self, buffer) -> tuple[float, float, float]:
