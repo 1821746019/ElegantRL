@@ -5,7 +5,7 @@ from typing import Tuple
 from multiprocessing import Pipe, Process
 
 TEN = th.Tensor
-
+SAVE_DIR_BASE = "runs"
 
 class Config:
     def __init__(self, agent_class=None, env_class=None, env_args=None):
@@ -67,7 +67,8 @@ class Config:
         self.learner_gpu_ids = ()  # multiple gpu id Tuple[int, ...] for learners. () means single GPU or CPU.
 
         '''Arguments for evaluate'''
-        self.cwd = None  # current working directory to save model. None means set automatically
+        self.save_dir = None  # current working directory to save model. None means set automatically
+        self.auto_increment_save_dir = True  # if True, the save_dir will be incremented by the number of the run
         self.if_remove = True  # remove the cwd folder? (True, False, None:ask me)
         self.break_step = np.inf  # break training if 'total_step > break_step'
         self.break_score = np.inf  # break training if `cumulative_rewards > break_score`
@@ -90,20 +91,91 @@ class Config:
         th.set_num_threads(self.num_threads)
         th.set_default_dtype(th.float32)
 
-        '''set cwd (current working directory) for saving model'''
-        if self.cwd is None:  # set cwd (current working directory) for saving model
-            self.cwd = f'./{self.env_name}_{self.agent_class.__name__[5:]}_{self.random_seed}'
+        '''set save_dir for saving model'''
+        # 1. Determine self.save_dir
+        if self.save_dir is None:
+            base_name_part = f'{self.env_name}_{self.agent_class.__name__[5:]}'
+            
+            if self.continue_train:
+                potential_dir_to_continue = None
+                if self.auto_increment_save_dir: # Expects previous run to be like basename_N
+                    latest_run_num = -1
+                    latest_dir_found = None
+                    current_search_num = 0
+                    while True:
+                        candidate_leaf = f"{base_name_part}_{current_search_num}"
+                        candidate_dir = os.path.join(SAVE_DIR_BASE, candidate_leaf)
+                        if os.path.exists(candidate_dir):
+                            latest_run_num = current_search_num
+                            latest_dir_found = candidate_dir
+                            current_search_num += 1
+                        else:
+                            break 
+                    if latest_dir_found:
+                        potential_dir_to_continue = latest_dir_found
+                        print(f"| Config: `continue_train` active, `save_dir` was None. Found latest run for continuation: {potential_dir_to_continue}")
+                else: # Expects previous run to be like basename_
+                    candidate_dir = os.path.join(SAVE_DIR_BASE, f"{base_name_part}_")
+                    if os.path.exists(candidate_dir):
+                        potential_dir_to_continue = candidate_dir
+                        print(f"| Config: `continue_train` active, `save_dir` was None. Found standard run for continuation: {potential_dir_to_continue}")
 
-        '''remove history'''
-        if self.if_remove is None:
-            self.if_remove = bool(input(f"| Arguments PRESS 'y' to REMOVE: {self.cwd}? ") == 'y')
-        if self.if_remove:
+                if potential_dir_to_continue:
+                    self.save_dir = potential_dir_to_continue
+                else:
+                    print(f"| Config WARNING: `continue_train` is True and `save_dir` was None, but no existing run directory found to resume from based on naming conventions.")
+                    print(f"|               To resume, explicitly set `config.save_dir` or ensure a previous run exists at the expected location.")
+                    print(f"|               Disabling `continue_train` and creating a new directory for a fresh run.")
+                    self.continue_train = False # Cannot continue if dir not found or auto-detection fails
+            
+            # If save_dir still None (i.e., not continuing, or continuation failed to find/set dir)
+            # This block is for creating a NEW run directory.
+            if self.save_dir is None:
+                if self.auto_increment_save_dir:
+                    run_num = 0
+                    while True:
+                        current_dir_leaf_name = f"{base_name_part}_{run_num}"
+                        self.save_dir = os.path.join(SAVE_DIR_BASE, current_dir_leaf_name) # Tentatively set for check
+                        if not os.path.exists(self.save_dir): # Found an unused name for a new run
+                            break
+                        run_num += 1
+                else: # Not auto-incrementing for a new run, use underscore
+                    self.save_dir = os.path.join(SAVE_DIR_BASE, f"{base_name_part}_")
+        # else: self.save_dir was user-specified. We will use it directly.
+
+        '''Handle directory removal based on `if_remove` and `continue_train` status'''
+        effective_if_remove = self.if_remove # Start with the user's preference
+
+        if self.continue_train: # User intends to continue training
+            if os.path.exists(self.save_dir): # And the target directory for continuation actually exists
+                if self.if_remove is True: # And user explicitly set if_remove=True
+                    print(f"| Config WARNING: `continue_train` is True and `if_remove` is True for directory '{self.save_dir}'. "
+                          f"Ignoring `if_remove=True` to prevent data loss for continuation.")
+                effective_if_remove = False # Override: Do not remove if successfully continuing from an existing directory
+            else: 
+                # User wants to continue, but target self.save_dir (whether user-set or auto-determined) does NOT exist.
+                # Continuation from this specific path is not possible.
+                print(f"| Config WARNING: `continue_train` is True, but the target directory '{self.save_dir}' for continuation does not exist.")
+                print(f"|               Cannot continue training from this path. Treating as a new run in this directory location.")
+                self.continue_train = False # Correct the state; it's now effectively a new run.
+                # effective_if_remove remains self.if_remove, to be handled for a new run.
+        
+        # If, after all checks, effective_if_remove is still None (typically if not continuing and if_remove wasn't explicitly set)
+        if effective_if_remove is None:
+            effective_if_remove = bool(input(f"| Arguments PRESS 'y' to REMOVE: {self.save_dir}? ") == 'y')
+
+        # Perform removal or print keep message
+        if effective_if_remove:
             import shutil
-            shutil.rmtree(self.cwd, ignore_errors=True)
-            print(f"| Arguments Remove cwd: {self.cwd}", flush=True)
+            shutil.rmtree(self.save_dir, ignore_errors=True)
+            print(f"| Arguments Remove cwd: {self.save_dir}", flush=True)
         else:
-            print(f"| Arguments Keep cwd: {self.cwd}", flush=True)
-        os.makedirs(self.cwd, exist_ok=True)
+            if self.continue_train and os.path.exists(self.save_dir): # Kept because we are continuing training
+                print(f"| Arguments Continuing in existing cwd: {self.save_dir}", flush=True)
+            else: # Kept for other reasons (user choice 'n', or it's a new dir and if_remove was False/None->No)
+                print(f"| Arguments Keep cwd: {self.save_dir}", flush=True)
+        
+        os.makedirs(self.save_dir, exist_ok=True)
 
     def get_if_off_policy(self) -> bool:
         agent_name = self.agent_class.__name__ if self.agent_class else ''

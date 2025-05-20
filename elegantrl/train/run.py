@@ -46,7 +46,7 @@ def train_agent_single_process(args: Config):
     '''init agent'''
     agent = args.agent_class(args.net_dims, args.state_dim, args.action_dim, gpu_id=args.gpu_id, args=args)
     if args.continue_train:
-        agent.save_or_load_agent(args.cwd, if_save=False)
+        agent.save_or_load_agent(args.save_dir, if_save=False)
 
     '''init agent.last_state'''
     state, info_dict = env.reset()
@@ -79,10 +79,10 @@ def train_agent_single_process(args: Config):
     eval_env_class = args.eval_env_class if args.eval_env_class else args.env_class
     eval_env_args = args.eval_env_args if args.eval_env_args else args.env_args
     eval_env = build_env(eval_env_class, eval_env_args, args.gpu_id)
-    evaluator = Evaluator(cwd=args.cwd, env=eval_env, args=args, if_tensorboard=args.use_tensorboard)
+    evaluator = Evaluator(cwd=args.save_dir, env=eval_env, args=args, if_tensorboard=args.use_tensorboard)
 
     '''train loop'''
-    cwd = args.cwd
+    cwd = args.save_dir
     break_step = args.break_step
     horizon_len = args.horizon_len
     if_off_policy = args.if_off_policy
@@ -236,7 +236,7 @@ class Learner(Process):
         '''Learner init agent'''
         agent = args.agent_class(args.net_dims, args.state_dim, args.action_dim, gpu_id=args.gpu_id, args=args)
         if args.continue_train:
-            agent.save_or_load_agent(args.cwd, if_save=False)
+            agent.save_or_load_agent(args.save_dir, if_save=False)
 
         '''Learner init buffer'''
         if args.if_off_policy:
@@ -266,7 +266,7 @@ class Learner(Process):
         state_dim = args.state_dim
         action_dim = args.action_dim
         horizon_len = args.horizon_len
-        cwd = args.cwd
+        cwd = args.save_dir
         del args
 
         agent.last_state = th.empty((num_seqs, state_dim), dtype=th.float32, device=agent.device)
@@ -377,7 +377,7 @@ class Worker(Process):
         '''init agent'''
         agent = args.agent_class(args.net_dims, args.state_dim, args.action_dim, gpu_id=args.gpu_id, args=args)
         if args.continue_train:
-            agent.save_or_load_agent(args.cwd, if_save=False)
+            agent.save_or_load_agent(args.save_dir, if_save=False)
 
         '''init agent.last_state'''
         state, info_dict = env.reset()
@@ -433,10 +433,10 @@ class EvaluatorProc(Process):
         eval_env_class = args.eval_env_class if args.eval_env_class else args.env_class
         eval_env_args = args.eval_env_args if args.eval_env_args else args.env_args
         eval_env = build_env(eval_env_class, eval_env_args, args.gpu_id)
-        evaluator = Evaluator(cwd=args.cwd, env=eval_env, args=args, if_tensorboard=False)
+        evaluator = Evaluator(cwd=args.save_dir, env=eval_env, args=args, if_tensorboard=False)
 
         '''loop'''
-        cwd = args.cwd
+        cwd = args.save_dir
         break_step = args.break_step
         device = th.device(f"cuda:{args.gpu_id}" if (th.cuda.is_available() and (args.gpu_id >= 0)) else "cpu")
         del args

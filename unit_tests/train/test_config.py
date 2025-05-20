@@ -40,14 +40,14 @@ def test_config():
     args.if_remove = False
     args.init_before_training()  # os.path.exists(args.cwd) == False
     args.init_before_training()  # os.path.exists(args.cwd) == True
-    assert os.path.exists(args.cwd)
-    os.rmdir(args.cwd)
+    assert os.path.exists(args.save_dir)
+    os.rmdir(args.save_dir)
 
     args.if_remove = True
     args.init_before_training()  # os.path.exists(args.cwd) == False
     args.init_before_training()  # os.path.exists(args.cwd) == True
-    assert os.path.exists(args.cwd)
-    os.rmdir(args.cwd)
+    assert os.path.exists(args.save_dir)
+    os.rmdir(args.save_dir)
 
 
 @patch('builtins.input', lambda *args: 'input_str')
@@ -63,8 +63,8 @@ def _config_init_before_training_yes():
     args = Config(agent_class=AgentSAC, env_class=env_class, env_args=env_args)
     args.if_remove = None
     args.init_before_training()
-    assert os.path.exists(args.cwd)
-    os.rmdir(args.cwd)
+    assert os.path.exists(args.save_dir)
+    os.rmdir(args.save_dir)
 
 
 @patch('builtins.input', lambda *args: 'n')
@@ -75,8 +75,8 @@ def _config_init_before_training_no():
     args = Config(agent_class=AgentSAC, env_class=env_class, env_args=env_args)
     args.if_remove = None
     args.init_before_training()
-    assert os.path.exists(args.cwd)
-    os.rmdir(args.cwd)
+    assert os.path.exists(args.save_dir)
+    os.rmdir(args.save_dir)
 
 
 def test_config_init_before_training():
