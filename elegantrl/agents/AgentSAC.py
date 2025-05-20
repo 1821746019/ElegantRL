@@ -23,6 +23,14 @@ class AgentSAC(AgentBase):
         self.cri = CriticEnsemble(net_dims, state_dim, action_dim, num_ensembles=self.num_ensembles).to(self.device)
         # self.act_target = deepcopy(self.act)
         self.cri_target = deepcopy(self.cri)
+
+        if hasattr(th, 'compile'):
+            self.act = th.compile(self.act)
+            self.cri = th.compile(self.cri)
+            # Target networks are deepcopies, compile them separately.
+            # self.act_target is commented out in the original code.
+            self.cri_target = th.compile(self.cri_target)
+
         self.act_optimizer = th.optim.Adam(self.act.parameters(), self.learning_rate)
         self.cri_optimizer = th.optim.Adam(self.cri.parameters(), self.learning_rate)
 
@@ -160,6 +168,14 @@ class AgentModSAC(AgentSAC):  # Modified SAC using reliable_lambda and Two Time-
         self.cri = CriticEnsemble(net_dims, state_dim, action_dim, num_ensembles=self.num_ensembles).to(self.device)
         self.act_target = deepcopy(self.act)
         self.cri_target = deepcopy(self.cri)
+
+        if hasattr(th, 'compile'):
+            self.act = th.compile(self.act)
+            self.cri = th.compile(self.cri)
+            # Target networks are deepcopies, compile them separately.
+            self.act_target = th.compile(self.act_target)
+            self.cri_target = th.compile(self.cri_target)
+
         self.act_optimizer = th.optim.Adam(self.act.parameters(), self.learning_rate)
         self.cri_optimizer = th.optim.Adam(self.cri.parameters(), self.learning_rate)
 

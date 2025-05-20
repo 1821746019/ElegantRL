@@ -21,6 +21,13 @@ class AgentPPO(AgentBase):
 
         self.act = ActorPPO(net_dims=net_dims, state_dim=state_dim, action_dim=action_dim).to(self.device)
         self.cri = CriticPPO(net_dims=net_dims, state_dim=state_dim, action_dim=action_dim).to(self.device)
+
+        if hasattr(th, 'compile'):
+            self.act = th.compile(self.act)
+            self.cri = th.compile(self.cri)
+            # AgentBase initializes act_target = act, cri_target = cri.
+            # So, target networks will also point to the compiled versions.
+
         self.act_optimizer = th.optim.Adam(self.act.parameters(), self.learning_rate)
         self.cri_optimizer = th.optim.Adam(self.cri.parameters(), self.learning_rate)
 
@@ -368,6 +375,13 @@ class AgentDiscretePPO(AgentPPO):
 
         self.act = ActorDiscretePPO(net_dims=net_dims, state_dim=state_dim, action_dim=action_dim).to(self.device)
         self.cri = CriticPPO(net_dims=net_dims, state_dim=state_dim, action_dim=action_dim).to(self.device)
+
+        if hasattr(th, 'compile'):
+            self.act = th.compile(self.act)
+            self.cri = th.compile(self.cri)
+            # AgentBase initializes act_target = act, cri_target = cri.
+            # So, target networks will also point to the compiled versions.
+
         self.act_optimizer = th.optim.Adam(self.act.parameters(), self.learning_rate)
         self.cri_optimizer = th.optim.Adam(self.cri.parameters(), self.learning_rate)
 
@@ -386,6 +400,13 @@ class AgentDiscreteA2C(AgentDiscretePPO):
 
         self.act = ActorDiscretePPO(net_dims=net_dims, state_dim=state_dim, action_dim=action_dim).to(self.device)
         self.cri = CriticPPO(net_dims=net_dims, state_dim=state_dim, action_dim=action_dim).to(self.device)
+
+        if hasattr(th, 'compile'):
+            self.act = th.compile(self.act)
+            self.cri = th.compile(self.cri)
+            # AgentBase initializes act_target = act, cri_target = cri.
+            # So, target networks will also point to the compiled versions.
+
         self.act_optimizer = th.optim.Adam(self.act.parameters(), self.learning_rate)
         self.cri_optimizer = th.optim.Adam(self.cri.parameters(), self.learning_rate)
 
