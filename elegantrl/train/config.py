@@ -3,7 +3,8 @@ import torch as th
 import numpy as np
 from typing import Tuple
 from multiprocessing import Pipe, Process
-
+from .lr_scheduler import WarmupCosineLR #显式导入确保类名能被搜索到
+import toml
 TEN = th.Tensor
 SAVE_DIR_BASE = "runs"
 
@@ -70,7 +71,7 @@ class Config:
         self.save_dir = None  # current working directory to save model. None means set automatically
         self.auto_increment_save_dir = True  # if True, the save_dir will be incremented by the number of the run
         self.if_remove = True  # remove the cwd folder? (True, False, None:ask me)
-        self.break_step = np.inf  # break training if 'total_step > break_step'
+        self.break_step = 1e6  # 默认训练1M步 break training if 'total_step > break_step'
         self.break_score = np.inf  # break training if `cumulative_rewards > break_score`
         self.if_keep_save = True  # keeping save the checkpoint. False means save until stop training.
         self.if_over_write = False  # overwrite the best policy network. `self.cwd/actor.pth`
@@ -82,7 +83,89 @@ class Config:
         self.eval_env_class = None  # eval_env = eval_env_class(*eval_env_args)
         self.eval_env_args = None  # eval_env = eval_env_class(*eval_env_args)
         self.eval_record_step = 0  # evaluator start recording after the exploration reaches this step.
+
+        '''Others'''
         self.use_tensorboard = False
+        self.use_AdamW = True
+        self.scheduler_name = 'WarmupCosineLR'
+        self.scheduler_args = {
+            'warmup_steps': self.break_step*0.1,
+            'max_steps': self.break_step,
+            'warmup_start_factor': 0.01,
+            'lr_min': 0.001*self.learning_rate,
+        }
+        self.scheduler_metric_for_plateau = None#'obj_avg_critic' 通常搭配ReduceLROnPlateau使用
+    def save_algo_hyperparams(self):
+        params_to_save = {}
+
+        # Define keys that should be excluded from the hyperparameter file.
+        # These are typically objects, runtime-specific data, configurations
+        # not central to the algorithm's definition, or the save directory itself.
+        excluded_keys = {
+            'agent_class',       # Object: e.g., <class 'elegantrl.agents.agent.AgentPPO'>
+            'env_class',         # Object: e.g., <function make at ...> or custom class object
+            'eval_env_class',    # Object or None
+            
+            'save_dir',          # This is the output directory path, not an algorithm hyperparameter.
+            
+            'learner_gpu_ids',   # Execution environment specific tuple
+            
+            # Training loop control / file system management flags
+            'continue_train',
+            'auto_increment_save_dir',
+            'if_remove',
+            'if_keep_save',
+            'if_over_write',
+            'if_save_buffer',
+            'save_gap',          # Frequency of saving, not a core algo param.
+
+            # Evaluation-specific parameters (distinct from training algo)
+            'eval_times',
+            'eval_per_step',
+            'eval_env_args',     # Dict for eval env. Can be complex; excluded from core algo hyperparams.
+            'eval_record_step',
+
+            # External tooling flags
+            'use_tensorboard',
+        }
+
+        # Add string representations for important class objects if they exist
+        if hasattr(self, 'agent_class') and self.agent_class is not None:
+            params_to_save['agent_class_name'] = self.agent_class.__name__
+        
+        if hasattr(self, 'env_class') and self.env_class is not None:
+            if hasattr(self.env_class, '__name__'): # For class objects
+                params_to_save['env_class_name'] = self.env_class.__name__
+            else: # For factory functions like gym.make, or other callables
+                params_to_save['env_class_repr'] = repr(self.env_class)
+        
+        if hasattr(self, 'eval_env_class') and self.eval_env_class is not None:
+            if hasattr(self.eval_env_class, '__name__'):
+                params_to_save['eval_env_class_name'] = self.eval_env_class.__name__
+            else:
+                params_to_save['eval_env_class_repr'] = repr(self.eval_env_class)
+
+        # Populate the dictionary with relevant hyperparameters
+        for key, value in self.__dict__.items():
+            if key not in excluded_keys:
+                params_to_save[key] = value
+        
+
+        hyperparams_file_path = os.path.join(self.save_dir, 'algo_hyperparams.toml')
+       
+        try:
+            with open(hyperparams_file_path, 'w') as f:
+                toml.dump(params_to_save, f)
+            print(f"| Config: Algorithm hyperparameters saved to: {hyperparams_file_path}")
+        except TypeError as e:
+            print(f"| Config ERROR: Error serializing hyperparameters to TOML: {e}")
+            print(f"  Failed to save to: {hyperparams_file_path}")
+            print("  Please check for non-serializable types in the config attributes "
+                  "(e.g., in 'env_args', 'scheduler_args', or other custom attributes).")
+        except Exception as e:
+            print(f"| Config ERROR: An unexpected error occurred while saving hyperparameters: {e}")
+            print(f"  Failed to save to: {hyperparams_file_path}")
+            
     def init_before_training(self):
         if self.random_seed is None:
             self.random_seed = max(0, self.gpu_id)
@@ -136,7 +219,7 @@ class Config:
                     while True:
                         current_dir_leaf_name = f"{base_name_part}_{run_num}"
                         self.save_dir = os.path.join(SAVE_DIR_BASE, current_dir_leaf_name) # Tentatively set for check
-                        if not os.path.exists(self.save_dir): # Found an unused name for a new run
+                        if not os.path.exists(self.save_dir) or is_folder_available(self.save_dir) : # Found an unused name for a new run
                             break
                         run_num += 1
                 else: # Not auto-incrementing for a new run, use underscore
@@ -176,7 +259,33 @@ class Config:
                 print(f"| Arguments Keep cwd: {self.save_dir}", flush=True)
         
         os.makedirs(self.save_dir, exist_ok=True)
-
+        self.save_algo_hyperparams()
+        # 后处理学习率调度
+        self.post_process_scheduler_args()
+    def post_process_scheduler_args(self):
+        if self.scheduler_name != 'WarmupCosineLR':return
+        # 后处理学习率调度
+        if self.num_workers > 0 and self.horizon_len > 0:
+            # This logic assumes the multiprocessing path via train_agent_multiprocessing
+            # where steps towards break_step are accumulated by (horizon_len * num_workers) per learner update cycle.
+            effective_env_steps_per_scheduler_activation = self.horizon_len * self.num_workers
+            if effective_env_steps_per_scheduler_activation == 0: # Should not happen with valid horizon_len and num_workers
+                total_scheduler_activations = int(self.break_step) # Fallback, though problematic
+            else:
+                total_scheduler_activations = int(self.break_step / effective_env_steps_per_scheduler_activation)
+        else:
+            # Fallback for single process or if num_workers/horizon_len is not set as expected (e.g. 0)
+            # For single process, effective_env_steps_per_scheduler_activation would be self.horizon_len
+            if self.horizon_len > 0:
+                total_scheduler_activations = int(self.break_step / self.horizon_len)
+            else:
+                total_scheduler_activations = int(self.break_step) # Fallback
+        warmup_steps_ratio=self.scheduler_args['warmup_steps']/self.scheduler_args['max_steps']
+        self.scheduler_args = {
+            **self.scheduler_args,
+            'max_steps': total_scheduler_activations,
+            'warmup_steps': int(total_scheduler_activations * warmup_steps_ratio), # e.g., 10% of total scheduler activations for warmup
+        }
     def get_if_off_policy(self) -> bool:
         agent_name = self.agent_class.__name__ if self.agent_class else ''
         on_policy_names = ('SARSA', 'VPG', 'A2C', 'A3C', 'TRPO', 'PPO', 'MPO')
@@ -411,6 +520,16 @@ def check_vec_env():
         print(f"| num_envs {num_envs}  {[t.shape for t in (state, reward, terminal, truncate)]}", flush=True)
     env.close() if hasattr(env, 'close') else None
 
+def is_folder_available(folder_path):
+    # 若存在.pt文件，则认为该文件夹不可用
+    # with os.scandir(folder_path) as entries:
+    #     return not any(entries)
+    if os.path.exists(folder_path):
+        for file in os.listdir(folder_path):
+            if file.endswith('.pt'):
+                return False
+    return True
 
 if __name__ == '__main__':
     check_vec_env()
+

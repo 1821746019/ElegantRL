@@ -4,6 +4,7 @@ import torch as th
 from torch import nn
 from torch.nn.utils import clip_grad_norm_
 from typing import Union, Optional
+import torch.optim.lr_scheduler # Added for LR Schedulers
 
 from ..train import Config
 from ..train import ReplayBuffer
@@ -57,8 +58,15 @@ class AgentBase:
         self.cri_target = self.cri
 
         '''optimizer'''
-        self.act_optimizer: Optional[th.optim] = None
-        self.cri_optimizer: Optional[th.optim] = None
+        self.act_optimizer: Optional[th.optim.Optimizer] = None
+        self.cri_optimizer: Optional[th.optim.Optimizer] = None
+
+        '''scheduler'''
+        self.scheduler_name = args.scheduler_name
+        self.scheduler_args = args.scheduler_args
+        self.scheduler_metric_for_plateau = args.scheduler_metric_for_plateau
+        self.act_scheduler: Optional[th.optim.lr_scheduler._LRScheduler] = None
+        self.cri_scheduler: Optional[th.optim.lr_scheduler._LRScheduler] = None
 
         self.criterion = getattr(args, 'criterion', th.nn.MSELoss(reduction="none"))
         self.if_vec_env = self.num_envs > 1  # use vectorized environment (vectorized simulator)
@@ -67,6 +75,9 @@ class AgentBase:
 
         """save and load"""
         self.save_attr_names = {'act', 'act_target', 'act_optimizer', 'cri', 'cri_target', 'cri_optimizer'}
+        if self.scheduler_name:
+            self.save_attr_names.update(['act_scheduler', 'cri_scheduler'])
+
         self.use_amp=use_amp
         self.scaler=th.amp.GradScaler("cuda") if use_amp else None
 
@@ -78,7 +89,7 @@ class AgentBase:
 
     def explore_action(self, state: TEN) -> TEN:
         if self.use_amp:
-            with th.amp.autocast('cuda'):
+            with th.amp.autocast('cuda'):# 新版写法，th.cuda.amp.autocast()废弃了
                 return self.act.get_action(state, action_std=self.explore_noise_std)
         else:
             return self.act.get_action(state, action_std=self.explore_noise_std)
@@ -176,7 +187,7 @@ class AgentBase:
         unmasks = th.logical_not(truncates)
         return states, actions, rewards, undones, unmasks
 
-    def update_net(self, buffer: Union[ReplayBuffer, tuple]) -> tuple[float, ...]:
+    def update_net(self, buffer: Union[ReplayBuffer, tuple]) -> dict:
         objs_critic = []
         objs_actor = []
 
@@ -193,7 +204,19 @@ class AgentBase:
 
         obj_avg_critic = np.nanmean(objs_critic) if len(objs_critic) else 0.0
         obj_avg_actor = np.nanmean(objs_actor) if len(objs_actor) else 0.0
-        return obj_avg_critic, obj_avg_actor
+        
+        self._step_schedulers(obj_avg_critic=obj_avg_critic, obj_avg_actor=obj_avg_actor)
+
+        actor_lr = self.act_optimizer.param_groups[0]['lr'] if self.act_optimizer and self.act_optimizer.param_groups else 0.0
+        critic_lr = self.cri_optimizer.param_groups[0]['lr'] if self.cri_optimizer and self.cri_optimizer.param_groups else 0.0
+        
+        log_data = {
+            "obj_critic": obj_avg_critic,
+            "obj_actor": obj_avg_actor,
+            "lr_actor": actor_lr,
+            "lr_critic": critic_lr,
+        }
+        return log_data
 
     def update_objectives(self, buffer: ReplayBuffer, update_t: int) -> tuple[float, float]:
         assert isinstance(update_t, int)
@@ -243,7 +266,7 @@ class AgentBase:
                 buffer.td_error_update_for_per(is_index.detach(), td_error.detach())
             else:
                 obj_critic = td_error.mean()
-            self.optimizer_backward(self.cri_optimizer, obj_critic)
+            self.optimizer_backward(self.cri_optimizer, obj_critic) # Will use non-AMP path if scaler is None
         
         self.soft_update(self.cri_target, self.cri, self.soft_update_tau)
 
@@ -265,7 +288,7 @@ class AgentBase:
             else:
                 action_pg = self.act(state)  # action to policy gradient
                 obj_actor = self.cri(state, action_pg).mean()
-                self.optimizer_backward(self.act_optimizer, -obj_actor)
+                self.optimizer_backward(self.act_optimizer, -obj_actor) # Will use non-AMP path
             
             self.soft_update(self.act_target, self.act, self.soft_update_tau)
         else:
@@ -293,20 +316,20 @@ class AgentBase:
         
         return cum_rewards
 
-    def optimizer_backward(self, optimizer: th.optim, objective: TEN):
+    def optimizer_backward(self, optimizer: th.optim.Optimizer, objective: TEN):
         """minimize the optimization objective via update the network parameters
 
         optimizer: `optimizer = th.optim.SGD(net.parameters(), learning_rate)`
         objective: `objective = net(...)` the optimization objective, sometimes is a loss function.
         """
-        if self.use_amp:
+        if self.use_amp: # Check if scaler is available
             return self.optimizer_backward_amp(optimizer,objective)
         optimizer.zero_grad()
         objective.backward()
         clip_grad_norm_(parameters=optimizer.param_groups[0]["params"], max_norm=self.clip_grad_norm)
         optimizer.step()
 
-    def optimizer_backward_amp(self, optimizer: th.optim, objective: TEN):  # automatic mixed precision
+    def optimizer_backward_amp(self, optimizer: th.optim.Optimizer, objective: TEN):  # automatic mixed precision
         """minimize the optimization objective via update the network parameters
 
         amp: Automatic Mixed Precision
@@ -314,7 +337,7 @@ class AgentBase:
         optimizer: `optimizer = th.optim.SGD(net.parameters(), learning_rate)`
         objective: `objective = net(...)` the optimization objective, sometimes is a loss function.
         """
-        
+        # Assuming self.scaler is already checked and is not None
         optimizer.zero_grad()
         self.scaler.scale(objective).backward()  # loss.backward()
         self.scaler.unscale_(optimizer)  # amp
@@ -341,18 +364,48 @@ class AgentBase:
         cwd: Current Working Directory. ElegantRL save training files in CWD.
         if_save: True: save files. False: load files.
         """
-        assert self.save_attr_names.issuperset({'act', 'act_optimizer'})
+        # self.save_attr_names was already updated in __init__ if scheduler_name is present
 
         for attr_name in self.save_attr_names:
             file_path = f"{cwd}/{attr_name}.pth"
 
-            if getattr(self, attr_name) is None:
+            # Check if the attribute exists and is not None before saving/loading
+            if not hasattr(self, attr_name) or getattr(self, attr_name) is None:
                 continue
 
             if if_save:
                 th.save(getattr(self, attr_name), file_path)
             elif os.path.isfile(file_path):
-                setattr(self, attr_name, th.load(file_path, map_location=self.device))
+                # For schedulers, they need to be instantiated first if we are to load their state_dict.
+                # However, the current code saves the whole object, so th.load recreates it.
+                # This is fine as long as the class definition is available.
+                loaded_attr = th.load(file_path, map_location=self.device)
+                setattr(self, attr_name, loaded_attr)
+            # else:
+            # print(f"| AgentBase Warning: File not found for {attr_name} at {file_path} during load.")
+
+    def _step_schedulers(self, **metrics):
+        """Steps the learning rate schedulers."""
+        schedulers_to_step = []
+        if hasattr(self, 'act_scheduler') and self.act_scheduler:
+            schedulers_to_step.append(self.act_scheduler)
+        if hasattr(self, 'cri_scheduler') and self.cri_scheduler:
+            schedulers_to_step.append(self.cri_scheduler)
+        # For SAC or other agents with more optimizers, they will add their schedulers here or in their own method
+        if hasattr(self, 'alpha_scheduler') and self.alpha_scheduler: # Check for SAC's alpha scheduler
+            schedulers_to_step.append(self.alpha_scheduler)
+
+        for scheduler in schedulers_to_step:
+            if isinstance(scheduler, th.optim.lr_scheduler.ReduceLROnPlateau):
+                metric_key = self.scheduler_metric_for_plateau
+                metric_value = metrics.get(metric_key)
+                if metric_value is not None:
+                    scheduler.step(metric_value)
+                else:
+                    print(f"| AgentBase Warning: ReduceLROnPlateau scheduler expects metric '{metric_key}' "
+                          f"but it was not found in provided metrics: {list(metrics.keys())}. Skipping step.")
+            else:
+                scheduler.step()
 
 
 def get_optim_param(optimizer: th.optim) -> list:  # backup

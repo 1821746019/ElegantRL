@@ -1,7 +1,7 @@
 import numpy as np
 import torch as th
 from torch import nn
-
+from ..train import lr_scheduler
 from .AgentBase import AgentBase
 from .AgentBase import build_mlp, layer_init_with_orthogonal
 from ..train import Config
@@ -27,9 +27,26 @@ class AgentPPO(AgentBase):
             self.cri = th.compile(self.cri)
             # AgentBase initializes act_target = act, cri_target = cri.
             # So, target networks will also point to the compiled versions.
+        optimizer_class=th.optim.AdamW if args.use_AdamW else th.optim.Adam
+        self.act_optimizer = optimizer_class(self.act.parameters(), lr=self.learning_rate)
+        self.cri_optimizer = optimizer_class(self.cri.parameters(), lr=self.learning_rate)
 
-        self.act_optimizer = th.optim.Adam(self.act.parameters(), self.learning_rate)
-        self.cri_optimizer = th.optim.Adam(self.cri.parameters(), self.learning_rate)
+        if self.scheduler_name:
+            SchedulerClass = None
+            try:
+                SchedulerClass = getattr(th.optim.lr_scheduler, self.scheduler_name)
+            except AttributeError:
+                try:
+                    SchedulerClass = getattr(lr_scheduler, self.scheduler_name)
+                except (ValueError, ImportError, AttributeError, NameError):
+                    print(f"Warning: Scheduler class '{self.scheduler_name}' could not be loaded. "
+                          f"Ensure it's in torch.optim.lr_scheduler, globally available, or a valid fully qualified name.")
+
+            if SchedulerClass:
+                if self.act_optimizer:
+                    self.act_scheduler = SchedulerClass(self.act_optimizer, **self.scheduler_args)
+                if self.cri_optimizer:
+                    self.cri_scheduler = SchedulerClass(self.cri_optimizer, **self.scheduler_args)
 
         self.ratio_clip = getattr(args, "ratio_clip", 0.25)  # `ratio.clamp(1 - clip, 1 + clip)`
         self.lambda_gae_adv = getattr(args, "lambda_gae_adv", 0.95)  # could be 0.80~0.99
@@ -143,7 +160,7 @@ class AgentPPO(AgentBase):
             actions, logprobs = self.act.get_action(state)
         return actions, logprobs
 
-    def update_net(self, buffer) -> tuple[float, float, float]:
+    def update_net(self, buffer) -> dict:
         buffer_size = buffer[0].shape[0]
 
         '''get advantages reward_sums'''
@@ -190,7 +207,20 @@ class AgentPPO(AgentBase):
         obj_entropy_avg = np.array(obj_entropies).mean() if len(obj_entropies) else 0.0
         obj_critic_avg = np.array(obj_critics).mean() if len(obj_critics) else 0.0
         obj_actor_avg = np.array(obj_actors).mean() if len(obj_actors) else 0.0
-        return obj_critic_avg, obj_actor_avg, obj_entropy_avg
+        
+        self._step_schedulers(obj_avg_critic=obj_critic_avg, obj_avg_actor=obj_actor_avg, obj_avg_entropy=obj_entropy_avg)
+
+        actor_lr = self.act_optimizer.param_groups[0]['lr'] if self.act_optimizer and self.act_optimizer.param_groups else 0.0
+        critic_lr = self.cri_optimizer.param_groups[0]['lr'] if self.cri_optimizer and self.cri_optimizer.param_groups else 0.0
+
+        log_data = {
+            "obj_critic": obj_critic_avg,
+            "obj_actor": obj_actor_avg,
+            "obj_entropy": obj_entropy_avg,
+            "lr_actor": actor_lr,
+            "lr_critic": critic_lr,
+        }
+        return log_data
 
     def update_objectives(self, buffer: tuple[TEN, ...], update_t: int) -> tuple[float, float, float]:
         states, actions, unmasks, logprobs, advantages, reward_sums = buffer
@@ -311,7 +341,7 @@ class AgentA2C(AgentPPO):
     "Asynchronous Methods for Deep Reinforcement Learning". 2016.
     """
 
-    def update_net(self, buffer) -> tuple[float, float, float]:
+    def update_net(self, buffer) -> dict:
         buffer_size = buffer[0].shape[0]
 
         '''get advantages reward_sums'''
@@ -344,7 +374,19 @@ class AgentA2C(AgentPPO):
 
         obj_critic_avg = np.array(obj_critics).mean() if len(obj_critics) else 0.0
         obj_actor_avg = np.array(obj_actors).mean() if len(obj_actors) else 0.0
-        return obj_critic_avg, obj_actor_avg, 0
+        
+        self._step_schedulers(obj_avg_critic=obj_critic_avg, obj_avg_actor=obj_actor_avg)
+
+        actor_lr = self.act_optimizer.param_groups[0]['lr'] if self.act_optimizer and self.act_optimizer.param_groups else 0.0
+        critic_lr = self.cri_optimizer.param_groups[0]['lr'] if self.cri_optimizer and self.cri_optimizer.param_groups else 0.0
+
+        log_data = {
+            "obj_critic": obj_critic_avg,
+            "obj_actor": obj_actor_avg,
+            "lr_actor": actor_lr,
+            "lr_critic": critic_lr,
+        }
+        return log_data
 
     def update_objectives(self, buffer: tuple[TEN, ...], update_t: int) -> tuple[float, float]:
         states, actions, unmasks, logprobs, advantages, reward_sums = buffer
@@ -381,9 +423,26 @@ class AgentDiscretePPO(AgentPPO):
             self.cri = th.compile(self.cri)
             # AgentBase initializes act_target = act, cri_target = cri.
             # So, target networks will also point to the compiled versions.
+        optimizer_class=th.optim.AdamW if args.use_AdamW else th.optim.Adam
+        self.act_optimizer = optimizer_class(self.act.parameters(), lr=self.learning_rate)
+        self.cri_optimizer = optimizer_class(self.cri.parameters(), lr=self.learning_rate)
 
-        self.act_optimizer = th.optim.Adam(self.act.parameters(), self.learning_rate)
-        self.cri_optimizer = th.optim.Adam(self.cri.parameters(), self.learning_rate)
+        if self.scheduler_name:
+            SchedulerClass = None
+            try:
+                SchedulerClass = getattr(th.optim.lr_scheduler, self.scheduler_name)
+            except AttributeError:
+                try:
+                    SchedulerClass = getattr(lr_scheduler, self.scheduler_name)
+                except (ValueError, ImportError, AttributeError, NameError):
+                    print(f"Warning: Scheduler class '{self.scheduler_name}' could not be loaded. "
+                          f"Ensure it's in torch.optim.lr_scheduler, globally available, or a valid fully qualified name.")
+
+            if SchedulerClass:
+                if self.act_optimizer:
+                    self.act_scheduler = SchedulerClass(self.act_optimizer, **self.scheduler_args)
+                if self.cri_optimizer:
+                    self.cri_scheduler = SchedulerClass(self.cri_optimizer, **self.scheduler_args)
 
         self.ratio_clip = getattr(args, "ratio_clip", 0.25)  # `ratio.clamp(1 - clip, 1 + clip)`
         self.lambda_gae_adv = getattr(args, "lambda_gae_adv", 0.95)  # could be 0.80~0.99
@@ -406,9 +465,26 @@ class AgentDiscreteA2C(AgentDiscretePPO):
             self.cri = th.compile(self.cri)
             # AgentBase initializes act_target = act, cri_target = cri.
             # So, target networks will also point to the compiled versions.
+        optimizer_class=th.optim.AdamW if args.use_AdamW else th.optim.Adam
+        self.act_optimizer = optimizer_class(self.act.parameters(), lr=self.learning_rate)
+        self.cri_optimizer = optimizer_class(self.cri.parameters(), lr=self.learning_rate)
 
-        self.act_optimizer = th.optim.Adam(self.act.parameters(), self.learning_rate)
-        self.cri_optimizer = th.optim.Adam(self.cri.parameters(), self.learning_rate)
+        if self.scheduler_name:
+            SchedulerClass = None
+            try:
+                SchedulerClass = getattr(th.optim.lr_scheduler, self.scheduler_name)
+            except AttributeError:
+                try:
+                    SchedulerClass = getattr(lr_scheduler, self.scheduler_name)
+                except (ValueError, ImportError, AttributeError, NameError):
+                    print(f"Warning: Scheduler class '{self.scheduler_name}' could not be loaded. "
+                          f"Ensure it's in torch.optim.lr_scheduler, globally available, or a valid fully qualified name.")
+
+            if SchedulerClass:
+                if self.act_optimizer:
+                    self.act_scheduler = SchedulerClass(self.act_optimizer, **self.scheduler_args)
+                if self.cri_optimizer:
+                    self.cri_scheduler = SchedulerClass(self.cri_optimizer, **self.scheduler_args)
 
         self.if_use_v_trace = getattr(args, 'if_use_v_trace', True)
 

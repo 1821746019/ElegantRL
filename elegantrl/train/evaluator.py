@@ -2,7 +2,7 @@ import os
 import time
 import numpy as np
 import torch as th
-from typing import Tuple, List
+from typing import Tuple, List, Dict
 
 from .config import Config
 
@@ -10,8 +10,8 @@ TEN = th.Tensor
 
 
 class Evaluator:
-    def __init__(self, cwd: str, env, args: Config, if_tensorboard: bool = False):
-        self.cwd = cwd  # current working directory to save model
+    def __init__(self, save_dir: str, env, args: Config):
+        self.save_dir = save_dir  # dir to save model
         self.env = env  # the env for Evaluator, `eval_env = env` in default
         self.agent_id = args.gpu_id
         self.total_step = 0  # the total training step
@@ -25,7 +25,7 @@ class Evaluator:
         self.if_keep_save = args.if_keep_save
         self.if_over_write = args.if_over_write
 
-        self.recorder_path = f'{cwd}/recorder.npy'
+        self.recorder_path = f'{save_dir}/recorder.npy'
         self.recorder = []  # total_step, r_avg, r_std, critic_value, ...
         self.recorder_step = args.eval_record_step  # start recording after the exploration reaches this step.
         self.max_r = -np.inf
@@ -47,13 +47,13 @@ class Evaluator:
         else:  # vectorized environment
             self.get_cumulative_rewards_and_step = self.get_cumulative_rewards_and_step_vectorized_env
 
-        if if_tensorboard:
+        if args.use_tensorboard:
             from torch.utils.tensorboard import SummaryWriter
-            self.tensorboard = SummaryWriter(f"{cwd}/tensorboard")
+            self.tensorboard = SummaryWriter(f"{save_dir}/tensorboard")
         else:
             self.tensorboard = None
 
-    def evaluate_and_save(self, actor: th.nn, steps: int, exp_r: float, logging_tuple: tuple):
+    def evaluate_and_save(self, actor: th.nn.Module, steps: int, exp_r: float, logging_data: Dict[str, any]):
         self.total_step += steps  # update total training steps
 
         if self.total_step < self.recorder_step:
@@ -73,30 +73,75 @@ class Evaluator:
         std_s = steps.std().item()
 
         train_time = int(time.time() - self.start_time)
-        value_tuple = [v for v in logging_tuple if isinstance(v, (int, float))]
-        logging_str = logging_tuple[-1]
+        
+        # Extract scalar values for printing and basic npy recording
+        # The order for npy recording was: total_step, avg_r, std_r, exp_r, *value_tuple
+        # value_tuple was (obj_c, obj_a, obj_e (if PPO), explore_rate (if off-policy))
+        # We need to reconstruct a similar tuple for self.recorder, but TensorBoard will use the dict directly.
+        
+        obj_c = logging_data.get('obj_critic', np.nan)
+        obj_a = logging_data.get('obj_actor', np.nan)
+        # PPO specific or other agent specific losses
+        obj_e = logging_data.get('obj_entropy', np.nan) # For PPO
+        alpha = logging_data.get('alpha', np.nan) # For SAC
+
+        # For console logging, we can create a list of values
+        # The original logging_tuple had (obj_c, obj_a, then for PPO: obj_e, explore_rate, action_dist_str)
+        # For SAC, it was (obj_c, obj_a, then explore_rate, action_dist_str)
+        # Now, log_data contains these directly by name.
+
+        # value_tuple for .npy recorder (maintaining old structure as much as possible)
+        # total_step, avg_r, std_r, exp_r, obj_c, obj_a, [obj_e/alpha], [explore_rate]
+        record_values = [obj_c, obj_a]
+        if 'obj_entropy' in logging_data: # PPO like
+            record_values.append(logging_data['obj_entropy'])
+        elif 'alpha' in logging_data: # SAC like
+            record_values.append(logging_data['alpha'])
+        # explore_rate was also part of the original logging_tuple for some agents.
+        if 'explore_rate' in logging_data:
+            record_values.append(logging_data['explore_rate'])
+        
+        logging_str = logging_data.get('action_dist', '') # Previously logging_tuple[-1]
 
         '''record the training information'''
-        self.recorder.append((self.total_step, avg_r, std_r, exp_r, *value_tuple))  # update recorder
+        self.recorder.append((self.total_step, avg_r, std_r, exp_r, *record_values))  # update recorder
+        
         if self.tensorboard:
-            self.tensorboard.add_scalar("info/critic_loss_sample", value_tuple[0], self.total_step)
-            self.tensorboard.add_scalar("info/actor_obj_sample", -1 * value_tuple[1], self.total_step)
-            self.tensorboard.add_scalar("reward/avg_reward_sample", avg_r, self.total_step)
-            self.tensorboard.add_scalar("reward/std_reward_sample", std_r, self.total_step)
-            self.tensorboard.add_scalar("reward/exp_reward_sample", exp_r, self.total_step)
+            # Standard losses and rewards
+            self.tensorboard.add_scalar("loss/critic", obj_c, self.total_step)
+            self.tensorboard.add_scalar("loss/actor", obj_a, self.total_step) # Note: For SAC, obj_a is already -objective
+            if 'obj_entropy' in logging_data:
+                self.tensorboard.add_scalar("loss/entropy_ppo", logging_data['obj_entropy'], self.total_step)
+            if 'alpha' in logging_data: # For SAC
+                self.tensorboard.add_scalar("param/alpha_sac", logging_data['alpha'], self.total_step)
 
-            self.tensorboard.add_scalar("info/critic_loss_time", value_tuple[0], train_time)
-            self.tensorboard.add_scalar("info/actor_obj_time", -1 * value_tuple[1], train_time)
-            self.tensorboard.add_scalar("reward/avg_reward_time", avg_r, train_time)
-            self.tensorboard.add_scalar("reward/std_reward_time", std_r, train_time)
-            self.tensorboard.add_scalar("reward/exp_reward_time", exp_r, train_time)
+            self.tensorboard.add_scalar("reward/avg_episode_return", avg_r, self.total_step)
+            self.tensorboard.add_scalar("reward/std_episode_return", std_r, self.total_step)
+            self.tensorboard.add_scalar("reward/exploration_return", exp_r, self.total_step)
+            self.tensorboard.add_scalar("episode/avg_length", avg_s, self.total_step)
+            
+            # Learning rates
+            if 'lr_actor' in logging_data:
+                self.tensorboard.add_scalar("lr/actor", logging_data['lr_actor'], self.total_step)
+            if 'lr_critic' in logging_data:
+                self.tensorboard.add_scalar("lr/critic", logging_data['lr_critic'], self.total_step)
+            if 'lr_alpha' in logging_data: # For SAC
+                self.tensorboard.add_scalar("lr/alpha_sac", logging_data['lr_alpha'], self.total_step)
+            
+            # Other params
+            if 'explore_rate' in logging_data: # For off-policy agents usually
+                self.tensorboard.add_scalar("param/explore_rate", logging_data['explore_rate'], self.total_step)
+
+            # Time-based logs (optional, if you want to see trends vs wall-clock time)
+            # self.tensorboard.add_scalar("loss/critic_vs_time", obj_c, train_time)
+            # ... etc for other metrics vs time
 
         '''print some information to Terminal'''
         prev_max_r = self.max_r
         self.max_r = max(self.max_r, avg_r)  # update max average cumulative rewards
         print(f"{self.agent_id:<3}{self.total_step:8.2e}{train_time:8.0f} |"
               f"{avg_r:8.2f}{std_r:7.1f}{avg_s:7.0f}{std_s:6.0f} |"
-              f"{exp_r:8.2f}{''.join(f'{n:7.2f}' for n in value_tuple)} {logging_str}", flush=True)
+              f"{exp_r:8.2f}{''.join(f'{v:7.2f}' for v in record_values if not isinstance(v, str))} {logging_str}", flush=True)
 
         if_save = avg_r > prev_max_r
         if if_save:
@@ -108,16 +153,16 @@ class Evaluator:
         actor_path = None
         if if_save:  # save checkpoint with the highest episode return
             if self.if_over_write:
-                actor_path = f"{self.cwd}/actor.pt"
+                actor_path = f"{self.save_dir}/actor.pt"
             else:
-                actor_path = f"{self.cwd}/actor__{self.total_step:012}_{self.max_r:09.3f}.pt"
+                actor_path = f"{self.save_dir}/actor__{self.total_step:012}_{self.max_r:09.3f}.pt"
 
         elif self.save_counter == self.save_gap:
             self.save_counter = 0
             if self.if_over_write:
-                actor_path = f"{self.cwd}/actor.pt"
+                actor_path = f"{self.save_dir}/actor.pt"
             else:
-                actor_path = f"{self.cwd}/actor__{self.total_step:012}.pt"
+                actor_path = f"{self.save_dir}/actor__{self.total_step:012}.pt"
 
         if actor_path:
             th.save(actor, actor_path)  # save policy network in *.pt
@@ -151,7 +196,7 @@ class Evaluator:
         total_step = int(self.recorder[-1][0])
         fig_title = f"step_time_maxR_{int(total_step)}_{int(train_time)}_{self.max_r:.3f}"
 
-        draw_learning_curve(recorder=recorder, fig_title=fig_title, save_path=f"{self.cwd}/LearningCurve.jpg")
+        draw_learning_curve(recorder=recorder, fig_title=fig_title, save_path=f"{self.save_dir}/LearningCurve.jpg")
         np.save(self.recorder_path, recorder)  # save self.recorder for `draw_learning_curve()`
 
 

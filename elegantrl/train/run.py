@@ -79,7 +79,7 @@ def train_agent_single_process(args: Config):
     eval_env_class = args.eval_env_class if args.eval_env_class else args.env_class
     eval_env_args = args.eval_env_args if args.eval_env_args else args.env_args
     eval_env = build_env(eval_env_class, eval_env_args, args.gpu_id)
-    evaluator = Evaluator(cwd=args.save_dir, env=eval_env, args=args, if_tensorboard=args.use_tensorboard)
+    evaluator = Evaluator(save_dir=args.save_dir, env=eval_env, args=args)
 
     '''train loop'''
     cwd = args.save_dir
@@ -122,11 +122,13 @@ def train_agent_single_process(args: Config):
         exp_r = buffer_items[2].mean().item()
 
         th.set_grad_enabled(True)
-        logging_tuple = agent.update_net(buffer)
-        logging_tuple = (*logging_tuple, agent.explore_rate, show_str)
+        log_data = agent.update_net(buffer)
         th.set_grad_enabled(False)
 
-        evaluator.evaluate_and_save(actor=agent.act, steps=horizon_len, exp_r=exp_r, logging_tuple=logging_tuple)
+        log_data['explore_rate'] = agent.explore_rate if hasattr(agent, 'explore_rate') else 0.0
+        log_data['action_dist'] = show_str
+
+        evaluator.evaluate_and_save(actor=agent.act, steps=horizon_len, exp_r=exp_r, logging_data=log_data)
         if_train = (evaluator.total_step <= break_step) and (not os.path.exists(f"{cwd}/stop"))
 
     print(f'| UsedTime: {time.time() - evaluator.start_time:>7.0f} | SavedDir: {cwd}', flush=True)
@@ -341,7 +343,11 @@ class Learner(Process):
             '''Learner send actor and training log to Evaluator'''
             if if_train:
                 exp_r = buffer_items_tensor[2].mean().item()  # the average rewards of exploration
-                self.eval_pipe.send((actor, num_steps, exp_r, logging_tuple))
+                
+                current_log_data = logging_tuple
+                current_log_data['explore_rate'] = agent.explore_rate if hasattr(agent, 'explore_rate') else 0.0
+                
+                self.eval_pipe.send((actor, num_steps, exp_r, current_log_data))
 
         '''Learner send the terminal signal to workers after break the loop'''
         print("| Learner Close Worker", flush=True)
@@ -433,7 +439,7 @@ class EvaluatorProc(Process):
         eval_env_class = args.eval_env_class if args.eval_env_class else args.env_class
         eval_env_args = args.eval_env_args if args.eval_env_args else args.env_args
         eval_env = build_env(eval_env_class, eval_env_args, args.gpu_id)
-        evaluator = Evaluator(cwd=args.save_dir, env=eval_env, args=args, if_tensorboard=False)
+        evaluator = Evaluator(save_dir=args.save_dir, env=eval_env, args=args)
 
         '''loop'''
         cwd = args.save_dir
@@ -444,14 +450,14 @@ class EvaluatorProc(Process):
         if_train = True
         while if_train:
             '''Evaluator receive training log from Learner'''
-            actor, steps, exp_r, logging_tuple = self.pipe0.recv()
+            actor, steps, exp_r, logging_data = self.pipe0.recv()
 
             '''Evaluator evaluate the actor and save the training log'''
             if actor is None:
                 evaluator.total_step += steps  # update total_step but don't update recorder
             else:
                 actor = actor.to(device) if os.name == 'nt' else actor  # WindowsNT_OS can only send cpu_tensor
-                evaluator.evaluate_and_save(actor, steps, exp_r, logging_tuple)
+                evaluator.evaluate_and_save(actor, steps, exp_r, logging_data)
 
             '''Evaluator send the training signal to Learner'''
             if_train = (evaluator.total_step <= break_step) and (not os.path.exists(f"{cwd}/stop"))

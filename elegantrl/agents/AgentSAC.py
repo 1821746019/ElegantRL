@@ -3,14 +3,14 @@ import numpy as np
 import torch as th
 from torch import nn
 from copy import deepcopy
-from typing import Tuple, List
+from typing import Tuple, List, Optional
 
 from .AgentBase import AgentBase
 from .AgentBase import ActorBase, CriticBase
 from .AgentBase import build_mlp, layer_init_with_orthogonal
 from ..train import Config
 from ..train import ReplayBuffer
-
+from ..train import lr_scheduler
 TEN = th.Tensor
 
 
@@ -31,12 +31,39 @@ class AgentSAC(AgentBase):
             # self.act_target is commented out in the original code.
             self.cri_target = th.compile(self.cri_target)
 
-        self.act_optimizer = th.optim.Adam(self.act.parameters(), self.learning_rate)
-        self.cri_optimizer = th.optim.Adam(self.cri.parameters(), self.learning_rate)
+        optimizer_class=th.optim.AdamW if args.use_AdamW else th.optim.Adam
+        self.act_optimizer = optimizer_class(self.act.parameters(), lr=self.learning_rate)
+        self.cri_optimizer = optimizer_class(self.cri.parameters(), lr=self.learning_rate)
 
         self.alpha_log = th.tensor((-1,), dtype=th.float32, requires_grad=True, device=self.device)  # trainable var
-        self.alpha_optim = th.optim.Adam((self.alpha_log,), lr=args.learning_rate)
+        self.alpha_optimizer = optimizer_class((self.alpha_log,), lr=args.learning_rate)
         self.target_entropy = np.log(action_dim)
+
+        self.alpha_scheduler: Optional[th.optim.lr_scheduler._LRScheduler] = None # Initialize alpha_scheduler
+        if self.scheduler_name:
+            SchedulerClass = None
+            # 1. Try torch.optim.lr_scheduler
+            try:
+                SchedulerClass = getattr(th.optim.lr_scheduler, self.scheduler_name)
+            except AttributeError:
+                # 2. Try fully qualified name or global name
+                try:
+                    SchedulerClass = getattr(lr_scheduler, self.scheduler_name)
+                except (ValueError, ImportError, AttributeError, NameError):
+                    print(f"Warning: Scheduler class '{self.scheduler_name}' could not be loaded. "
+                          f"Ensure it's in torch.optim.lr_scheduler, globally available, or a valid fully qualified name.")
+            
+            if SchedulerClass:
+                if self.act_optimizer:
+                    self.act_scheduler = SchedulerClass(self.act_optimizer, **self.scheduler_args)
+                if self.cri_optimizer:
+                    self.cri_scheduler = SchedulerClass(self.cri_optimizer, **self.scheduler_args)
+                # 默认不对alpha进行调度
+                # if self.alpha_optimizer: # For SAC agent
+                #     self.alpha_scheduler = SchedulerClass(self.alpha_optimizer, **self.scheduler_args)
+            
+            if self.alpha_optimizer: # Ensure alpha_scheduler is added to save_attr_names if alpha_optimizer exists
+                self.save_attr_names.update(['alpha_scheduler'])
 
     def explore_action(self, state: TEN) -> TEN:
         if self.use_amp:
@@ -124,15 +151,15 @@ class AgentSAC(AgentBase):
                 action_pg, logprob = self.act.get_action_logprob(state)  # policy gradient
                 obj_alpha = (self.alpha_log * (self.target_entropy - logprob).detach()).mean()
             
-            self.alpha_optim.zero_grad()
+            self.alpha_optimizer.zero_grad()
             self.scaler.scale(obj_alpha).backward()
-            self.scaler.unscale_(self.alpha_optim)
-            self.scaler.step(self.alpha_optim)
+            self.scaler.unscale_(self.alpha_optimizer)
+            self.scaler.step(self.alpha_optimizer)
             self.scaler.update()
         else:
             action_pg, logprob = self.act.get_action_logprob(state)  # policy gradient
             obj_alpha = (self.alpha_log * (self.target_entropy - logprob).detach()).mean()
-            self.optimizer_backward(self.alpha_optim, obj_alpha)
+            self.optimizer_backward(self.alpha_optimizer, obj_alpha)
 
         # 使用混合精度处理actor网络的前向传播和反向传播
         alpha = self.alpha_log.exp().detach()
@@ -158,6 +185,20 @@ class AgentSAC(AgentBase):
         # self.soft_update(self.act_target, self.act, self.soft_update_tau)
         return obj_critic.item(), obj_actor.item()
 
+    def update_net(self, buffer: ReplayBuffer) -> dict:
+        log_data_base = super().update_net(buffer)
+
+        alpha_value = self.alpha_log.exp().detach().item()
+        alpha_lr = self.alpha_optimizer.param_groups[0]['lr'] if self.alpha_optimizer and self.alpha_optimizer.param_groups else 0.0
+
+        log_data_sac = {
+            "alpha": alpha_value,
+            "lr_alpha": alpha_lr,
+        }
+        
+        log_data_base.update(log_data_sac)
+        return log_data_base
+
 
 class AgentModSAC(AgentSAC):  # Modified SAC using reliable_lambda and Two Time-scale Update Rule
     def __init__(self, net_dims: [int], state_dim: int, action_dim: int, gpu_id: int = 0, args: Config = Config()):
@@ -176,12 +217,38 @@ class AgentModSAC(AgentSAC):  # Modified SAC using reliable_lambda and Two Time-
             self.act_target = th.compile(self.act_target)
             self.cri_target = th.compile(self.cri_target)
 
-        self.act_optimizer = th.optim.Adam(self.act.parameters(), self.learning_rate)
-        self.cri_optimizer = th.optim.Adam(self.cri.parameters(), self.learning_rate)
+        optimizer_class=th.optim.AdamW if args.use_AdamW else th.optim.Adam
+        self.act_optimizer = optimizer_class(self.act.parameters(), lr=self.learning_rate)
+        self.cri_optimizer = optimizer_class(self.cri.parameters(), lr=self.learning_rate)
 
         self.alpha_log = th.tensor((-1,), dtype=th.float32, requires_grad=True, device=self.device)  # trainable var
-        self.alpha_optim = th.optim.Adam((self.alpha_log,), lr=args.learning_rate)
+        self.alpha_optimizer = optimizer_class((self.alpha_log,), lr=args.learning_rate)
         self.target_entropy = getattr(args, 'target_entropy', -np.log(action_dim))
+
+        self.alpha_scheduler: Optional[th.optim.lr_scheduler._LRScheduler] = None # Initialize alpha_scheduler
+        if self.scheduler_name:
+            SchedulerClass = None
+            # 1. Try torch.optim.lr_scheduler
+            try:
+                SchedulerClass = getattr(th.optim.lr_scheduler, self.scheduler_name)
+            except AttributeError:
+                # 2. Try fully qualified name or global name
+                try:
+                    SchedulerClass = getattr(lr_scheduler, self.scheduler_name)
+                except (ValueError, ImportError, AttributeError, NameError):
+                    print(f"Warning: Scheduler class '{self.scheduler_name}' could not be loaded. "
+                          f"Ensure it's in torch.optim.lr_scheduler, globally available, or a valid fully qualified name.")
+            
+            if SchedulerClass:
+                if self.act_optimizer:
+                    self.act_scheduler = SchedulerClass(self.act_optimizer, **self.scheduler_args)
+                if self.cri_optimizer:
+                    self.cri_scheduler = SchedulerClass(self.cri_optimizer, **self.scheduler_args)
+                if self.alpha_optimizer: # For SAC agent
+                    self.alpha_scheduler = SchedulerClass(self.alpha_optimizer, **self.scheduler_args)
+            
+            if self.alpha_optimizer: # Ensure alpha_scheduler is added to save_attr_names if alpha_optimizer exists
+                self.save_attr_names.update(['alpha_scheduler'])
 
         # for reliable_lambda
         self.critic_tau = getattr(args, 'critic_tau', 0.995)
@@ -252,15 +319,15 @@ class AgentModSAC(AgentSAC):  # Modified SAC using reliable_lambda and Two Time-
                 action_pg, logprob = self.act.get_action_logprob(state)  # policy gradient
                 obj_alpha = (self.alpha_log * (self.target_entropy - logprob).detach()).mean()
             
-            self.alpha_optim.zero_grad()
+            self.alpha_optimizer.zero_grad()
             self.scaler.scale(obj_alpha).backward()
-            self.scaler.unscale_(self.alpha_optim)
-            self.scaler.step(self.alpha_optim)
+            self.scaler.unscale_(self.alpha_optimizer)
+            self.scaler.step(self.alpha_optimizer)
             self.scaler.update()
         else:
             action_pg, logprob = self.act.get_action_logprob(state)  # policy gradient
             obj_alpha = (self.alpha_log * (self.target_entropy - logprob).detach()).mean()
-            self.optimizer_backward(self.alpha_optim, obj_alpha)
+            self.optimizer_backward(self.alpha_optimizer, obj_alpha)
 
         # 使用混合精度处理actor网络的前向传播和反向传播
         alpha = self.alpha_log.exp().detach()
@@ -293,6 +360,20 @@ class AgentModSAC(AgentSAC):  # Modified SAC using reliable_lambda and Two Time-
         else:
             obj_actor = th.tensor(th.nan)
         return obj_critic.item(), obj_actor.item()
+
+    def update_net(self, buffer: ReplayBuffer) -> dict:
+        log_data_base = super().update_net(buffer)
+
+        alpha_value = self.alpha_log.exp().detach().item()
+        alpha_lr = self.alpha_optimizer.param_groups[0]['lr'] if self.alpha_optimizer and self.alpha_optimizer.param_groups else 0.0
+
+        log_data_sac = {
+            "alpha": alpha_value,
+            "lr_alpha": alpha_lr,
+        }
+        
+        log_data_base.update(log_data_sac)
+        return log_data_base
 
 
 '''network'''
