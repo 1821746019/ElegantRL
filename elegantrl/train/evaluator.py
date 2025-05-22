@@ -108,8 +108,11 @@ class Evaluator:
         
         if self.tensorboard:
             # Standard losses and rewards
-            self.tensorboard.add_scalar("loss/critic", obj_c, self.total_step)
-            self.tensorboard.add_scalar("loss/actor", obj_a, self.total_step) # Note: For SAC, obj_a is already -objective
+            self.tensorboard.add_scalar("objective/critic", obj_c, self.total_step)
+            # Likely SAC, where obj_a is actor loss (already negative of objective)，越小越好，从0变负
+            # For other agents (e.g., PPO), obj_a is typically an objective to maximize，越大越好
+            self.tensorboard.add_scalar("objective/actor", obj_a, self.total_step)
+
             if 'obj_entropy' in logging_data:
                 self.tensorboard.add_scalar("loss/entropy_ppo", logging_data['obj_entropy'], self.total_step)
             if 'alpha' in logging_data: # For SAC
