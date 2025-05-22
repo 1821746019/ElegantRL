@@ -9,13 +9,9 @@
 *recorder.npy
 *replay*.npz
 
-# Runs created by Isaac Gym
-runs/
-
 # VS Code
 **/.vscode
 # JetBrains folder
 .idea/
 .env-erl/
 *.egg-info
-# runs/

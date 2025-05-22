@@ -1,0 +1,46 @@
+agent_class_name = "AgentPPO"
+env_class_name = "make"
+num_envs = 1
+if_off_policy = false
+env_name = "Pendulum-v1"
+max_step = 1000
+state_dim = 3
+action_dim = 1
+if_discrete = false
+gamma = 0.99
+reward_scale = 0.5
+net_dims = [ 64, 64,]
+learning_rate = 0.03
+clip_grad_norm = 3.0
+state_value_tau = 0
+soft_update_tau = 0.005
+batch_size = 128
+horizon_len = 2048
+repeat_times = 8.0
+if_use_vtrace = true
+gpu_id = 0
+num_workers = 16
+num_threads = 4
+random_seed = 0
+break_step = 1000000.0
+break_score = inf
+use_AdamW = true
+scheduler_name = "WarmupCosineLR"
+target_step = 1000
+
+[env_args]
+id = "Pendulum-v1"
+env_name = "Pendulum-v1"
+num_envs = 1
+max_step = 1000
+state_dim = 3
+action_dim = 1
+if_discrete = false
+reward_scale = 0.5
+gpu_id = 0
+
+[scheduler_args]
+max_steps = 1000000.0
+warmup_steps = 100000.0
+warmup_start_factor = 0.01
+lr_min = 3e-5

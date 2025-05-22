@@ -261,30 +261,29 @@ class Config:
         os.makedirs(self.save_dir, exist_ok=True)
         self.save_algo_hyperparams()
         # 后处理学习率调度
-        self.post_process_scheduler_args()
-    def post_process_scheduler_args(self):
+        self.postprocess_scheduler_args()
+    def postprocess_scheduler_args(self):
         if self.scheduler_name != 'WarmupCosineLR':return
-        # 后处理学习率调度
+        # 后处理学习率调度器参数，因为不是每次环境step都会调用scheduler.step()，所以需要根据horizon_len和num_workers计算出总的调度次数
+        lr_total_steps =self.scheduler_args['total_steps']
         if self.num_workers > 0 and self.horizon_len > 0:
             # This logic assumes the multiprocessing path via train_agent_multiprocessing
             # where steps towards break_step are accumulated by (horizon_len * num_workers) per learner update cycle.
             effective_env_steps_per_scheduler_activation = self.horizon_len * self.num_workers
             if effective_env_steps_per_scheduler_activation == 0: # Should not happen with valid horizon_len and num_workers
-                total_scheduler_activations = int(self.break_step) # Fallback, though problematic
+                total_scheduler_activations = int(lr_total_steps) # Fallback, though problematic
             else:
-                total_scheduler_activations = int(self.break_step / effective_env_steps_per_scheduler_activation)
+                total_scheduler_activations = int(lr_total_steps / effective_env_steps_per_scheduler_activation)
         else:
             # Fallback for single process or if num_workers/horizon_len is not set as expected (e.g. 0)
             # For single process, effective_env_steps_per_scheduler_activation would be self.horizon_len
             if self.horizon_len > 0:
-                total_scheduler_activations = int(self.break_step / self.horizon_len)
+                total_scheduler_activations = int(lr_total_steps / self.horizon_len)
             else:
-                total_scheduler_activations = int(self.break_step) # Fallback
-        warmup_steps_ratio=self.scheduler_args['warmup_steps']/self.scheduler_args['max_steps']
+                total_scheduler_activations = int(lr_total_steps) # Fallback
         self.scheduler_args = {
             **self.scheduler_args,
-            'max_steps': total_scheduler_activations,
-            'warmup_steps': int(total_scheduler_activations * warmup_steps_ratio), # e.g., 10% of total scheduler activations for warmup
+            'total_steps': total_scheduler_activations,
         }
     def get_if_off_policy(self) -> bool:
         agent_name = self.agent_class.__name__ if self.agent_class else ''
